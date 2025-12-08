@@ -1,7 +1,7 @@
 // Listen for messages from popup
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'startUnfollow') {
-    autoUnfollow()
+    autoUnfollow(request.unfollowFollowing, request.unfollowFriend)
       .then((result) => {
         // result: { success, count, message }
         if (result && result.success) {
@@ -22,6 +22,14 @@ async function autoScrollToLoadAll(maxScrolls = 50, scrollDelay = 500) {
   // Find the scrollable container (TikTok's following list is usually in a modal or div)
   let scrollContainer = null;
 
+  // Try TikTok-specific data-e2e selectors first (most reliable)
+  const tikTokSelectors = [
+    '[data-e2e="scroll-list"]',           // TikTok scroll list
+    '[data-e2e="recommended-user-list"]', // Recommended users list
+    '[data-e2e="search-user-list"]',      // Search user list
+    '[data-e2e="follow-info-popup"]',     // Follow info popup
+  ];
+
   // Try common selectors for the scrollable container
   const containerSelectors = [
     '[role="dialog"]',           // Modal container
@@ -32,13 +40,17 @@ async function autoScrollToLoadAll(maxScrolls = 50, scrollDelay = 500) {
     'div[style*="overflow"]',    // Divs with overflow CSS
   ];
 
+  // Combine all selectors (TikTok-specific first)
+  const allSelectors = [...tikTokSelectors, ...containerSelectors];
+
   // Try to find a container that has scrollHeight > clientHeight
-  for (const selector of containerSelectors) {
+  for (const selector of allSelectors) {
     try {
       const elements = document.querySelectorAll(selector);
       for (const el of elements) {
         if (el.scrollHeight > el.clientHeight) {
           scrollContainer = el;
+          console.log('Found scrollable container with selector:', selector);
           break;
         }
       }
@@ -53,7 +65,7 @@ async function autoScrollToLoadAll(maxScrolls = 50, scrollDelay = 500) {
     scrollContainer = window;
     console.log('No modal container found, using window scroll');
   } else {
-    console.log('Found scrollable container:', scrollContainer.className || scrollContainer.tagName);
+    console.log('Found scrollable container:', scrollContainer.className || scrollContainer.tagName, scrollContainer.getAttribute('data-e2e'));
   }
 
   let scrollCount = 0;
@@ -85,7 +97,7 @@ async function autoScrollToLoadAll(maxScrolls = 50, scrollDelay = 500) {
   });
 }
 
-async function autoUnfollow() {
+async function autoUnfollow(unfollowFollowing = true, unfollowFriend = false) {
   // First, send a message to the popup indicating we're scrolling
   try { chrome.runtime.sendMessage({ action: 'progress', message: 'Loading all followers...' }); } catch (e) {}
 
@@ -127,34 +139,66 @@ async function autoUnfollow() {
     return !!(rect.width || rect.height) && window.getComputedStyle(el).visibility !== 'hidden' && el.offsetParent !== null;
   }
 
-  // Filter candidates by text that indicates 'Following' / 'Unfollow' (case-insensitive)
-  const buttons = candidates.filter(el => {
+  // Filter candidates by text and track type separately
+  const followingButtons = [];
+  const friendButtons = [];
+
+  candidates.forEach(el => {
     try {
-      if (!isVisible(el)) return false;
+      if (!isVisible(el)) return;
       const text = (el.innerText || el.textContent || '').trim().toLowerCase();
-      return /(^|\s)(following|unfollow|following\b)/i.test(text) || text.includes('following') || text.includes('unfollow');
+      
+      // Check if we should include this button based on checkbox settings
+      const hasFollowing = text.includes('following') || text.includes('unfollow');
+      const hasFriend = text.includes('friends') || text.includes('friend') || text.includes('remove');
+      
+      if (unfollowFollowing && hasFollowing) followingButtons.push(el);
+      else if (unfollowFriend && hasFriend) friendButtons.push(el);
     } catch (e) {
-      return false;
+      // ignore
     }
   });
 
-  console.log('Candidate elements found:', candidates.length, 'Filtered unfollow buttons:', buttons.length);
+  // Combine buttons
+  const buttons = [...followingButtons, ...friendButtons];
+
+  console.log('Candidate elements found:', candidates.length);
+  console.log('Following buttons found:', followingButtons.length);
+  console.log('Friend buttons found:', friendButtons.length);
+  console.log('Total filtered unfollow buttons:', buttons.length);
 
   if (buttons.length === 0) {
     return { success: false, count: 0, message: 'No following/unfollow buttons found on this page.' };
   }
 
   // Send a message showing total found before starting unfollows
-  try { chrome.runtime.sendMessage({ action: 'totalFound', count: buttons.length, candidates: candidates.length }); } catch (e) {}
+  try { 
+    chrome.runtime.sendMessage({ 
+      action: 'totalFound', 
+      count: buttons.length, 
+      candidates: candidates.length,
+      followingCount: followingButtons.length,
+      friendCount: friendButtons.length
+    }); 
+  } catch (e) {}
 
   let i = 0;
+  let followingUnfollowed = 0;
+  let friendUnfollowed = 0;
 
   return new Promise((resolve) => {
     function clickNext() {
       if (i >= buttons.length) {
         console.log('Finished unfollowing all available users.');
         // Notify popup that we're done
-        try { chrome.runtime.sendMessage({ action: 'done', count: buttons.length }); } catch (e) {}
+        try { 
+          chrome.runtime.sendMessage({ 
+            action: 'done', 
+            count: buttons.length,
+            followingCount: followingUnfollowed,
+            friendCount: friendUnfollowed
+          }); 
+        } catch (e) {}
 
         resolve({ success: true, count: buttons.length, message: 'Unfollowing complete.' });
         return;
@@ -163,6 +207,14 @@ async function autoUnfollow() {
       const btn = buttons[i];
       const text = (btn.innerText || btn.textContent || '').trim();
       console.log('Unfollowing:', text);
+
+      // Determine if this is a following or friend button
+      const isFollowing = i < followingButtons.length;
+      if (isFollowing) {
+        followingUnfollowed++;
+      } else {
+        friendUnfollowed++;
+      }
 
       // Try clicking in a safe way
       try {
@@ -176,8 +228,15 @@ async function autoUnfollow() {
 
       i++;
 
-      // Send progress update to popup (number unfollowed so far)
-      try { chrome.runtime.sendMessage({ action: 'progress', count: i }); } catch (e) {}
+      // Send progress update to popup (with separate counts)
+      try { 
+        chrome.runtime.sendMessage({ 
+          action: 'progress', 
+          count: i,
+          followingCount: followingUnfollowed,
+          friendCount: friendUnfollowed
+        }); 
+      } catch (e) {}
 
       // Delay 2 seconds between clicks
       setTimeout(clickNext, 2000);
